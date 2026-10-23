@@ -999,6 +999,8 @@ impl App {
             .bounds(0, 0, 0, 0)
             .create(control_handler)?;
         queue.attach(&control);
+        // The Recycle Bin is counted on a worker; a flipped answer re-syncs the desktop.
+        shell::set_recycle_bin_notify(control.hwnd(), WM_APP_FS_CHANGED, 1);
         std::mem::forget(control_class); // class lives for the process
 
         // Desktop anchor (z-order, show desktop, quick hide, icon hiding).
