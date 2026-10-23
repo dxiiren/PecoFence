@@ -249,29 +249,90 @@ pub fn recycle_bin_changed() {
 
 static RECYCLE_BIN_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// Whether the Recycle Bin holds anything (decides between the full and empty icon). Each
-/// fixed drive is asked on its own: the all-drives form fails as a whole when one volume
-/// (card reader without media, offline mapped drive) cannot answer. When no drive answers,
-/// the last known state is kept rather than flipping to "empty". Asking touches every fixed
-/// drive (a sleeping one wakes, which can take seconds), so the answer is reused until
-/// `recycle_bin_changed` or for ten minutes.
+/// Where the Recycle Bin worker reports back: the window, the message and its `wparam`.
+static RECYCLE_BIN_NOTIFY: std::sync::Mutex<Option<(isize, u32, usize)>> =
+    std::sync::Mutex::new(None);
+
+/// The worker that asks the Recycle Bin posts `message` to `hwnd` when the answer flipped, so
+/// the caller re-reads `recycle_bin_has_items` (now cheap) and redraws the bin's icon.
+pub fn set_recycle_bin_notify(hwnd: HWND, message: u32, wparam: usize) {
+    *RECYCLE_BIN_NOTIFY.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((hwnd.0 as isize, message, wparam));
+}
+
+/// Whether the Recycle Bin holds anything (decides between the full and empty icon). Never
+/// waits for the shell: the answer is the last one known (empty until the first query ends),
+/// and a stale answer is refreshed on a worker thread, one at a time. Counting the bin walks
+/// every record in it, which takes minutes for a bin with tens of thousands of items and
+/// would freeze the UI thread. When the answer flips, the worker posts the message from
+/// `set_recycle_bin_notify`. Each fixed drive is asked on its own: the all-drives form fails
+/// as a whole when one volume (card reader without media, offline mapped drive) cannot
+/// answer. When no drive answers, the last known state is kept rather than flipping to
+/// "empty". Asking touches every fixed drive (a sleeping one wakes, which can take seconds),
+/// so the answer is reused until `recycle_bin_changed` or for ten minutes.
 pub fn recycle_bin_has_items() -> bool {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     static LAST_KNOWN: AtomicBool = AtomicBool::new(false);
     static ASKED: Mutex<Option<Instant>> = Mutex::new(None);
-    let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
-    let recent = asked.is_some_and(|t| t.elapsed() < Duration::from_secs(600));
-    if recent && !RECYCLE_BIN_STALE.swap(false, Ordering::Relaxed) {
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    let recent = ASKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some_and(|t| t.elapsed() < Duration::from_secs(600));
+    // A query in flight picks up a change noticed meanwhile (the stale flag stays set).
+    if (recent && !RECYCLE_BIN_STALE.load(Ordering::Relaxed))
+        || RUNNING.swap(true, Ordering::AcqRel)
+    {
         return LAST_KNOWN.load(Ordering::Relaxed);
     }
-    RECYCLE_BIN_STALE.store(false, Ordering::Relaxed);
-    *asked = Some(Instant::now());
+    let work = move || {
+        let _com = crate::com::OleGuard::init();
+        loop {
+            RECYCLE_BIN_STALE.store(false, Ordering::Relaxed);
+            *ASKED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+            let started = Instant::now();
+            let answer = query_recycle_bin();
+            tracing::debug!(
+                ?answer,
+                ms = started.elapsed().as_millis() as u64,
+                "recycle bin asked"
+            );
+            if let Some(full) = answer
+                && LAST_KNOWN.swap(full, Ordering::Relaxed) != full
+                && let Some((hwnd, message, wparam)) =
+                    *RECYCLE_BIN_NOTIFY.lock().unwrap_or_else(|e| e.into_inner())
+            {
+                crate::window::post_message(
+                    HWND(hwnd as *mut core::ffi::c_void),
+                    message,
+                    wparam,
+                    0,
+                );
+            }
+            if !RECYCLE_BIN_STALE.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        RUNNING.store(false, Ordering::Release);
+    };
+    if let Err(error) = std::thread::Builder::new()
+        .name("pecofence-recycle-bin".into())
+        .spawn(work)
+    {
+        RUNNING.store(false, Ordering::Release);
+        tracing::warn!(%error, "recycle bin query thread failed to start");
+    }
+    LAST_KNOWN.load(Ordering::Relaxed)
+}
+
+/// Asks every fixed drive's Recycle Bin whether it holds anything: `None` when no drive
+/// answered. Blocks for as long as the shell needs (see `recycle_bin_has_items`).
+fn query_recycle_bin() -> Option<bool> {
     // SAFETY: no arguments; returns a bitmask.
     let drives = unsafe { GetLogicalDrives() };
     let mut answered = false;
-    let mut full = false;
     for i in 0..26u32 {
         if drives & (1 << i) == 0 {
             continue;
@@ -289,17 +350,11 @@ pub fn recycle_bin_has_items() -> bool {
         if unsafe { SHQueryRecycleBinW(PCWSTR(root.as_ptr()), &mut info) }.is_ok() {
             answered = true;
             if info.i64NumItems > 0 {
-                full = true;
-                break;
+                return Some(true);
             }
         }
     }
-    if answered {
-        LAST_KNOWN.store(full, Ordering::Relaxed);
-        full
-    } else {
-        LAST_KNOWN.load(Ordering::Relaxed)
-    }
+    answered.then_some(false)
 }
 
 /// The special desktop items the user has enabled in Windows (Recycle Bin, This PC, ...), as
